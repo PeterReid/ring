@@ -1,5 +1,5 @@
 // Copyright 2015-2016 Brian Smith.
-// Portions Copyright (c) 2015, Google Inc.
+// Portions Copyright (c) 2014, 2015, Google Inc.
 //
 // Permission to use, copy, modify, and/or distribute this software for any
 // purpose with or without fee is hereby granted, provided that the above
@@ -16,31 +16,115 @@
 // TODO: enforce maximum input length.
 
 use {c, chacha, constant_time, error};
+use core;
+use polyfill::slice::u32_from_le_u8;
 
-pub struct SigningContext {
-    state: State,
+struct AlignedBlockState<'a> {
+    buf: [u8; BLOCK_STATE_SIZE + 7],
+    inner: &'a mut [u8; BLOCK_STATE_SIZE],
+}
+impl<'a> AlignedBlockState<'a> {
+    pub fn new(inner: &mut [u8; BLOCK_STATE_SIZE]) -> AlignedBlockState {
+        let mut st = AlignedBlockState {
+            buf: [0u8; BLOCK_STATE_SIZE + 7],
+            inner: inner,
+        };
+        AlignedBlockState::align(&mut st.buf).copy_from_slice(&st.inner[..]);
+        st
+    }
+    fn align(xs: &mut [u8; BLOCK_STATE_SIZE + 7]) -> &mut [u8; BLOCK_STATE_SIZE] {
+        let aligned_start = (xs.as_ptr() as usize + 7) & !7;
+        let offset = aligned_start - (xs.as_ptr() as usize);
+        slice_as_array_ref_mut!(&mut xs[offset..offset+BLOCK_STATE_SIZE], BLOCK_STATE_SIZE).unwrap()
+    }
+    pub fn aligned_buf(&mut self) -> &mut [u8; BLOCK_STATE_SIZE] {
+        AlignedBlockState::align(&mut self.buf)
+    }
+}
+impl<'a> Drop for AlignedBlockState<'a> {
+    fn drop(&mut self) {
+        self.inner.copy_from_slice(AlignedBlockState::align(&mut self.buf));
+    }
 }
 
 impl SigningContext {
     #[inline]
     pub fn from_key(key: Key) -> SigningContext {
-        let mut ctx = SigningContext {
-            state: [0u8; STATE_LEN],
+        let mut ctx = SigningContext{
+            opaque: [0; BLOCK_STATE_SIZE],
+            nonce: [0; 4],
+            buf: [0; BLOCK_LEN],
+            buf_used: 0,
+            func: Funcs {
+                blocks_fn: GFp_poly1305_blocks,
+                emit_fn: GFp_poly1305_emit
+            }
         };
-        unsafe { GFp_poly1305_init(&mut ctx.state, &key.bytes); }
+        check_block_state_layout();
+
+        let set_fns = init(AlignedBlockState::new(&mut ctx.opaque).aligned_buf(), &key.bytes, &mut ctx.func) == 0;
+        // TODO XXX: It seems at least some implementations |poly1305_init| always
+        // return the same value, so this conditional logic isn't always necessary.
+        // And, for platforms that have such conditional logic also in the ASM code,
+        // it seems it would be better to move the conditional logic out of the asm
+        // and into the higher-level code.
+        if !set_fns {
+            ctx.func.blocks_fn = GFp_poly1305_blocks;
+            ctx.func.emit_fn = GFp_poly1305_emit;
+        }
+
+        ctx.nonce = [
+            u32_from_le_u8(slice_as_array_ref!(&key.bytes[16..20], 4).unwrap()),
+            u32_from_le_u8(slice_as_array_ref!(&key.bytes[20..24], 4).unwrap()),
+            u32_from_le_u8(slice_as_array_ref!(&key.bytes[24..28], 4).unwrap()),
+            u32_from_le_u8(slice_as_array_ref!(&key.bytes[28..32], 4).unwrap()),
+        ];
         ctx
     }
 
-    #[inline]
-    pub fn update(&mut self, input: &[u8]) {
-        unsafe {
-            GFp_poly1305_update(&mut self.state, input.as_ptr(), input.len());
+    pub fn update(&mut self, mut input: &[u8]) {
+        let mut block_state = AlignedBlockState::new(&mut self.opaque);
+        let block_state_buf = block_state.aligned_buf();
+
+        if self.buf_used != 0 {
+            let todo = core::cmp::min(input.len(), BLOCK_LEN - self.buf_used);
+
+            self.buf[self.buf_used .. self.buf_used + todo].copy_from_slice(&input[..todo]);
+            self.buf_used += todo;
+            input = &input[todo..];
+
+            if self.buf_used == BLOCK_LEN {
+                self.func.blocks(block_state_buf, &mut self.buf, 1 /* pad */);
+                self.buf_used = 0;
+            }
+        }
+
+        if input.len() >= BLOCK_LEN {
+            let todo = input.len() & !(BLOCK_LEN - 1);
+            let (complete_blocks, remainder) = input.split_at(todo);
+            self.func.blocks(block_state_buf, complete_blocks, 1 /* pad */);
+            input = remainder;
+        }
+
+        if input.len() != 0 {
+            self.buf[..input.len()].copy_from_slice(input);
+            self.buf_used = input.len();
         }
     }
 
-    #[inline]
     pub fn sign(mut self, tag_out: &mut Tag) {
-        unsafe { GFp_poly1305_finish(&mut self.state, tag_out); }
+        let mut block_state = AlignedBlockState::new(&mut self.opaque);
+        let block_state_buf = block_state.aligned_buf();
+
+        if self.buf_used != 0 {
+            self.buf[self.buf_used] = 1;
+            for byte in &mut self.buf[self.buf_used+1..] {
+                *byte = 0;
+            }
+            self.func.blocks(block_state_buf, &self.buf[..], 0 /* already padded */);
+        }
+
+        self.func.emit(block_state_buf, tag_out, &self.nonce);
     }
 }
 
@@ -55,6 +139,26 @@ pub fn sign(key: Key, msg: &[u8], tag: &mut Tag) {
     let mut ctx = SigningContext::from_key(key);
     ctx.update(msg);
     ctx.sign(tag)
+}
+
+#[inline]
+fn check_block_state_layout() {
+    let required_block_state_size =
+        if cfg!(target_arch = "x86") {
+            // See comment above |_poly1305_init_sse2| in poly1305-x86.pl.
+            Some(4 * (5 + 1 + 4 + 2 + 4 * 9))
+        } else if cfg!(target_arch = "x86_64") {
+            // See comment above |__poly1305_block| in poly1305-x86_64.pl.
+            Some(4 * (5 + 1 + 2 * 2 + 2 + 4 * 9))
+        } else {
+            // TODO(davidben): Figure out the layout of the struct. For now,
+            // |POLY1305_BLOCK_STATE_SIZE| is taken from OpenSSL.
+            None
+        };
+
+    if let Some(required_block_state_size) = required_block_state_size {
+        assert!(core::mem::size_of::<BlockState>() >= required_block_state_size);
+    }   
 }
 
 /// A Poly1305 key.
@@ -87,26 +191,61 @@ pub type Tag = [u8; TAG_LEN];
 /// The length of a `Tag`.
 pub const TAG_LEN: usize = 128 / 8;
 
-type State = [u8; STATE_LEN];
-const STATE_LEN: usize = 256;
+const BLOCK_STATE_SIZE: usize = 192;
+
+const BLOCK_LEN: usize = 16;
+
+/// The memory manipulated by the assembly. Using u64s ensures 8-byte alignment,
+/// which some of the assembly implementations need.
+pub type BlockState = [u8; BLOCK_STATE_SIZE];
+
+#[repr(C)]
+struct Funcs {
+    blocks_fn: unsafe extern fn(*mut BlockState, *const u8, c::size_t, u32), 
+    emit_fn: unsafe extern fn(*mut BlockState, *mut Tag, *const [u32; 4]),
+}
+
+fn init(state: &mut BlockState, key: &KeyBytes, func: *mut Funcs) -> i32 {
+    unsafe {
+        GFp_poly1305_init_asm(state, key, func)
+    }
+}
+
+impl Funcs {
+    #[inline]
+    fn blocks(&self, state: &mut BlockState, data: &[u8], should_pad: u32) {
+        unsafe {
+            (self.blocks_fn)(state, data.as_ptr(), data.len(), should_pad)
+        };
+    }
+
+    #[inline]
+    fn emit(&self, state: &mut BlockState, tag: &mut Tag, nonce: &[u32; 4]) {
+        unsafe {
+             (self.emit_fn)(state, tag, nonce);
+        }
+    }
+}
+
+pub struct SigningContext {
+    opaque: BlockState,
+    nonce: [u32; 4],
+    buf: [u8; BLOCK_LEN],
+    buf_used: usize,
+    func: Funcs
+}
 
 extern {
-    fn GFp_poly1305_init(state: &mut State, key: &KeyBytes);
-    fn GFp_poly1305_finish(state: &mut State, mac: &mut Tag);
-    fn GFp_poly1305_update(state: &State, in_: *const u8, in_len: c::size_t);
+    fn GFp_poly1305_init_asm(state: *mut BlockState, key: *const KeyBytes, out_func: *mut Funcs) -> c::int;
+    fn GFp_poly1305_blocks(state: *mut BlockState, input: *const u8, len: c::size_t, padbit: u32);
+    fn GFp_poly1305_emit(state: *mut BlockState, mac: *mut Tag, nonce: *const [u32; 4]);
 }
 
 #[cfg(test)]
 mod tests {
-    use {c, error, test};
+    use {error, test};
     use core;
     use super::*;
-
-    #[test]
-    pub fn test_poly1305_state_len() {
-        assert_eq!((super::STATE_LEN + 255) / 256,
-                   (unsafe { GFp_POLY1305_STATE_LEN } + 255) / 256);
-    }
 
     // Adapted from BoringSSL's crypto/poly1305/poly1305_test.cc.
     #[test]
@@ -194,9 +333,5 @@ mod tests {
         assert_eq!(&expected_mac[..], &actual_mac);
 
         Ok(())
-    }
-
-    extern {
-        static GFp_POLY1305_STATE_LEN: c::size_t;
     }
 }
