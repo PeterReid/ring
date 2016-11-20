@@ -218,9 +218,12 @@ fn init(state: &mut BlockState, key: &KeyBytes, func: *mut Funcs) -> i32 {
 impl Funcs {
     #[inline]
     fn blocks(&self, state: &mut BlockState, data: &[u8], should_pad: u32) {
+        println!("opaque(pre) = {:?}", state.to_vec());
+        println!("data[0..{}] = {:?}", data.len(), data.to_vec());
         unsafe {
             (self.blocks_fn)(state, data.as_ptr(), data.len(), should_pad)
         };
+        println!("opaque(post) = {:?}", state.to_vec());
     }
 
     #[inline]
@@ -287,6 +290,7 @@ mod tests {
                 ctx.sign(&mut actual_mac);
                 assert_eq!(&expected_mac[..], &actual_mac[..]);
             }
+            if true { panic!("see"); }
             {
                 let key = Key::from_test_vector(&key);
                 let mut actual_mac = [0; TAG_LEN];
