@@ -158,7 +158,11 @@ fn check_block_state_layout() {
 
     if let Some(required_block_state_size) = required_block_state_size {
         assert!(core::mem::size_of::<BlockState>() >= required_block_state_size);
-    }   
+    }
+    
+    if false {
+        sillytest();
+    }
 }
 
 /// A Poly1305 key.
@@ -235,10 +239,20 @@ pub struct SigningContext {
     func: Funcs
 }
 
-extern {
+extern "C" {
     fn GFp_poly1305_init_asm(state: *mut BlockState, key: *const KeyBytes, out_func: *mut Funcs) -> c::int;
     fn GFp_poly1305_blocks(state: *mut BlockState, input: *const u8, len: c::size_t, padbit: u32);
     fn GFp_poly1305_emit(state: *mut BlockState, mac: *mut Tag, nonce: *const [u32; 4]);
+}
+
+pub fn sillytest() {
+    unsafe {
+        let mut opaque = [10u8; BLOCK_STATE_SIZE];
+        let mut opaque_aligned = AlignedBlockState::new(&mut opaque);
+        let xs = [1u8; 60];
+        GFp_poly1305_blocks(opaque_aligned.aligned_buf(), xs.as_ptr(), xs.len(), 1);
+        panic!("state = {:?}", opaque_aligned.aligned_buf().to_vec());
+    }
 }
 
 #[cfg(test)]
@@ -246,6 +260,11 @@ mod tests {
     use {error, test};
     use core;
     use super::*;
+
+    #[test]
+    pub fn silly() {
+        sillytest();
+    }
 
     // Adapted from BoringSSL's crypto/poly1305/poly1305_test.cc.
     #[test]
