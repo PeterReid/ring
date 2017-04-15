@@ -79,6 +79,14 @@ uint32_t GFp_armcap_P = 0;
 
 #endif
 
+#ifndef OPENSSL_WINDOWS
+#include <errno.h>
+OPENSSL_EXPORT int GFp_errno(void);
+int GFp_errno(void) {
+    return errno;
+}
+#endif
+
 /* These allow tests in other languages to verify that their understanding of
  * the C types matches the C compiler's understanding. */
 
@@ -100,5 +108,8 @@ DEFINE_METRICS(uint64_t)
 
 DEFINE_METRICS(int)
 DEFINE_METRICS(long)
+
+typedef unsigned int uint;
+DEFINE_METRICS(uint)
 
 DEFINE_METRICS(size_t)
