@@ -127,6 +127,7 @@ mod sysrand_chunk {
 
     extern {
         fn syscall(number: c::long, ...) -> c::long;
+        static errno: c::int;
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -143,20 +144,20 @@ mod sysrand_chunk {
     #[inline]
     pub fn chunk(dest: &mut [u8]) -> Result<usize, error::Unspecified> {
         let chunk_len: c::size_t = dest.len();
-        let flags: c::int = 0;
+        let flags: c::uint = 0;
         let r = unsafe {
             syscall(GETRANDOM, dest.as_mut_ptr(), chunk_len, flags)
         };
         if r < 0 {
-            if r == EINTR {
+            if errno == EINTR {
                 // If an interrupt occurs while getrandom() is blocking
                 // to wait for the entropy pool, then EINTR is returned.
                 // Returning 0 will cause the caller to try again.
-                return Ok( 0 )
+                return Ok(0);
             }
             return Err(error::Unspecified);
         }
-        Ok( r as usize )
+        Ok(r as usize)
     }
 }
 
@@ -179,9 +180,9 @@ mod sysrand_chunk {
         let len = min(dest.len(), i32::MAX as usize);
 
         if unsafe { SystemFunction036(dest.as_mut_ptr(), len as u32) } != 0 {
-            Ok( len )
+            Ok(len)
         } else {
-            Err( error::Unspecified)
+            Err(error::Unspecified)
         }
     }
 }
